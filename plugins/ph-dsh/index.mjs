@@ -124,6 +124,20 @@ const loadDeps = async (config = {}) => {
 export const name = 'perfect-harness'
 export const inject = [] // every service is probed at use time — optional everywhere
 
+/** Working directory of the Session that dispatched the command, if readable. */
+const callerDirectory = (ctx, agent) => {
+  try {
+    const wd = ctx.get('workingDirectory')
+    if (agent?.session && typeof wd?.get === 'function') return wd.get(agent.session)
+  } catch { /* service optional */ }
+  try { return agent?.session?.header?.cwd } catch { return undefined }
+}
+
+/** The preset a live Agent is composed from (undefined when unbound). */
+const callerPreset = (ctx, agent) => {
+  try { return ctx.get('agentPresets')?.composedPreset?.(agent?.ctx) } catch { return undefined }
+}
+
 export function apply(ctx, config = {}) {
   // Lesson files default under $DSH_HOME: a plugin's cwd is not writable in
   // every host (headless/sandboxed profiles), and losing the library on a
@@ -131,11 +145,18 @@ export function apply(ctx, config = {}) {
   const dataDir = typeof config.dataDir === 'string' && config.dataDir
     ? config.dataDir
     : join(process.env.DSH_HOME ?? homedir(), 'perfect-harness')
+  // The base rollout mounts `baseSpec`; the thinking channels mount
+  // `config.model`. Those must agree or the base probe assembles without a
+  // route and dies at {{model}} interpolation while the judge/compose calls
+  // succeed — measured on a desktop profile. `config.baseSpec.model` wins when
+  // it is explicit; otherwise the configured channel route IS the base route.
+  const baseSpec = { ...(config.baseSpec ?? {}) }
+  if (!baseSpec.model && config.model) baseSpec.model = config.model
   const state = {
     deps: null,
     library: null,
     lessonFile: join(dataDir, 'ph-lessons.json'),
-    baseSpec: config.baseSpec ?? {},
+    baseSpec,
     lastStep: null,
   }
   const log = (m) => { try { ctx.logger?.info?.(`[ph] ${m}`) } catch { /* logger optional */ } }
@@ -171,42 +192,94 @@ export function apply(ctx, config = {}) {
     ].join('\n')
   }
 
-  const step = async (rawInput, agent) => {
+  const step = async (rawInput, invocation) => {
     // `rawInput` is everything after the command name and starts with the
     // separator whitespace: ' step fix the tests'. Strip the subcommand word
     // AFTER trimming, or the task prompt silently begins with "step".
     const taskText = String(rawInput ?? '').trim().replace(/^step\b\s*/i, '').trim()
     if (!taskText) return 'usage: /ph step <task text>'
+    const route = config.model ?? state.baseSpec.model
+    // Fail before the first paid call: an unconfigured route mounts a probe
+    // agent that dies at {{model}} assembly, which still costs a full step.
+    if (!route?.provider || !route?.model) {
+      throw new Error('no model route for probe agents — set the plugin config model: {provider, model} (or config.baseSpec.model) before /ph step')
+    }
     const notes = []
     const deps = await ensureDeps()
-    const substrate = createDshSubstrate({ ctx, deps, opts: {} })
-    const channels = createDshChannels({
-      substrate,
-      spec: { model: config.model ?? state.baseSpec.model },
-      notes,
-      retries: 1,
-    })
-    const gate = createDshHumanGate({ ctx, notes })
-    const library = await ensureLibrary()
-    const started = Date.now()
-    const r = await runImprovementStep({
-      task: { id: `ph-step-${Date.now()}`, domain: 'interactive', prompt: taskText },
-      baseSpec: state.baseSpec,
-      substrate, channels, gate, library,
-      requireHuman: true,
-    })
-    if (r.adoptedSpec && r.improved) state.baseSpec = r.adoptedSpec // adopted spec becomes the new harness
-    if (r.lesson) {
-      try { await mkdir(dirname(state.lessonFile), { recursive: true }); await state.store.save(library) } catch (e) { notes.push(`lesson persist failed: ${String(e?.message ?? e).slice(0, 120)}`) }
+    // Probes should be clones of the harness the human is actually using.
+    // Without the caller's cwd and preset they inherit the host process cwd and
+    // only the globally registered tools (measured: one `working_directory`),
+    // so every rollout ends "(no deliverable)" and the step burns tokens for
+    // nothing.
+    const caller = invocation?.agent
+    const cwd = callerDirectory(ctx, caller)
+    const preset = callerPreset(ctx, caller)
+    const signal = invocation?.signal
+    const substrate = createDshSubstrate({ ctx, deps, opts: cwd ? { cwd } : {} })
+    const live = new Set()
+    const mountProbe = substrate.mount.bind(substrate)
+    const disposeProbe = substrate.dispose.bind(substrate)
+    let aborted = false
+    // The command registry settles the UI request on abort, but nothing stops
+    // the loop: measured 7 probe sessions created over 48s *after* the caller
+    // aborted. Cancel live probes and refuse to mount more.
+    const cancelProbes = () => {
+      aborted = true
+      for (const handle of live) {
+        try { handle?.agent?.cancel?.({ kind: 'user' }) } catch { /* already gone */ }
+      }
     }
-    state.lastStep = { improved: r.improved, label: r.adoptedLabel, at: Date.now() }
-    return [
-      `step ${r.ok ? 'completed' : 'incomplete'} in ${((Date.now() - started) / 1000).toFixed(1)}s — ${r.improved ? `ADOPTED ${r.adoptedLabel}` : 'base kept'}`,
-      `  gate: ${r.trail?.selection ? `${r.trail.selection.reason} → ${r.notes.find((n) => n.startsWith('gate:')) ?? ''}` : r.notes.find((n) => n.startsWith('gate:')) ?? 'no gate event'}`,
-      r.lesson ? `  lesson: ${r.lesson.lesson}` : '  lesson: none',
-      ...notes.slice(0, 12).map((n) => `  · ${n}`),
-      ...(notes.length > 12 ? [`  … +${notes.length - 12} notes`] : []),
-    ].join('\n')
+    if (signal?.aborted) cancelProbes()
+    else signal?.addEventListener?.('abort', cancelProbes, { once: true })
+
+    substrate.mount = async (spec) => {
+      if (aborted) throw new Error('ph step aborted — no further probes mounted')
+      let handle
+      if (preset) {
+        try {
+          handle = await mountProbe(spec, { agentPreset: preset })
+        } catch (e) {
+          notes.push(`probe preset "${preset}" mount failed (${String(e?.message ?? e).slice(0, 120)}) — mounting without it`)
+          handle = await mountProbe(spec, {})
+        }
+      } else {
+        handle = await mountProbe(spec, {})
+      }
+      live.add(handle)
+      return handle
+    }
+    substrate.dispose = async (handle) => {
+      live.delete(handle)
+      return disposeProbe(handle)
+    }
+
+    try {
+      const channels = createDshChannels({ substrate, spec: { model: route }, notes, retries: 1 })
+      const gate = createDshHumanGate({ ctx, notes })
+      const library = await ensureLibrary()
+      const started = Date.now()
+      const r = await runImprovementStep({
+        task: { id: `ph-step-${Date.now()}`, domain: 'interactive', prompt: taskText },
+        baseSpec: state.baseSpec,
+        substrate, channels, gate, library,
+        requireHuman: true,
+      })
+      if (r.adoptedSpec && r.improved) state.baseSpec = r.adoptedSpec // adopted spec becomes the new harness
+      if (r.lesson) {
+        try { await mkdir(dirname(state.lessonFile), { recursive: true }); await state.store.save(library) } catch (e) { notes.push(`lesson persist failed: ${String(e?.message ?? e).slice(0, 120)}`) }
+      }
+      state.lastStep = { improved: r.improved, label: r.adoptedLabel, at: Date.now() }
+      if (aborted) notes.push('the dispatching request was aborted — remaining probes were cancelled')
+      return [
+        `step ${r.ok ? 'completed' : 'incomplete'} in ${((Date.now() - started) / 1000).toFixed(1)}s — ${r.improved ? `ADOPTED ${r.adoptedLabel}` : 'base kept'}`,
+        `  gate: ${r.trail?.selection ? `${r.trail.selection.reason} → ${r.notes.find((n) => n.startsWith('gate:')) ?? ''}` : r.notes.find((n) => n.startsWith('gate:')) ?? 'no gate event'}`,
+        r.lesson ? `  lesson: ${r.lesson.lesson}` : '  lesson: none',
+        ...notes.slice(0, 12).map((n) => `  · ${n}`),
+        ...(notes.length > 12 ? [`  … +${notes.length - 12} notes`] : []),
+      ].join('\n')
+    } finally {
+      signal?.removeEventListener?.('abort', cancelProbes)
+    }
   }
 
   // dsh-commands normalizes every handler result into a discriminated union
@@ -227,11 +300,12 @@ export function apply(ctx, config = {}) {
         name: 'ph',
         description: 'PerfectHarness — recursive harness optimization. /ph status | step <task> | lessons',
         input: { hint: 'status | step <task> | lessons' },
-        handler: async ({ rawInput }) => {
+        handler: async (invocation) => {
+          const rawInput = invocation?.rawInput
           const cmd = (rawInput ?? '').trim().split(/\s+/)[0] ?? 'status'
           try {
             if (cmd === 'status') return ok(await status())
-            if (cmd === 'step') return ok(await step(rawInput))
+            if (cmd === 'step') return ok(await step(rawInput, invocation))
             if (cmd === 'lessons') {
               const lib = await ensureLibrary()
               const entries = lib.entries ?? []
