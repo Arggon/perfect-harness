@@ -127,7 +127,7 @@ export const inject = [] // every service is probed at use time — optional eve
 // Bump on every behavioral change: /ph status prints this, so a host running a
 // hot-reloaded module is distinguishable from one still on the previous
 // generation without guessing from behavior.
-const BUILD = '2026-10-25.4'
+const BUILD = '2026-10-25.5'
 
 /** Working directory of the Session that dispatched the command, if readable. */
 const callerDirectory = (ctx, agent) => {
@@ -220,11 +220,45 @@ export function apply(ctx, config = {}) {
     const cwd = callerDirectory(ctx, caller)
     const preset = callerPreset(ctx, caller)
     const signal = invocation?.signal
-    const substrate = createDshSubstrate({ ctx, deps, opts: cwd ? { cwd } : {} })
-    const live = new Set()
-    const mountProbe = substrate.mount.bind(substrate)
-    const disposeProbe = substrate.dispose.bind(substrate)
     let aborted = false
+    const live = new Set()
+
+    // The rollout substrate carries the caller's world (cwd + preset). The
+    // CHANNEL substrate must not: propose/compose/judge are single-shot JSON
+    // calls by contract ("each channel call is a FRESH mount — no shared
+    // context"). Composing the preset into them gives the channel agent real
+    // tools, and it answers by investigating instead of replying JSON —
+    // measured: "propose: unparseable reply — no proposals", so the step had
+    // nothing to adopt and never reached the gate.
+    const makeSubstrate = (withPreset) => {
+      const sub = createDshSubstrate({ ctx, deps, opts: cwd ? { cwd } : {} })
+      const mount = sub.mount.bind(sub)
+      const dispose = sub.dispose.bind(sub)
+      sub.mount = async (spec) => {
+        if (aborted) throw new Error('ph step aborted — no further probes mounted')
+        let handle
+        if (withPreset && preset) {
+          try {
+            handle = await mount(spec, { agentPreset: preset, composePreset: preset })
+          } catch (e) {
+            notes.push(`probe preset "${preset}" mount failed (${String(e?.message ?? e).slice(0, 120)}) — mounting without it`)
+            handle = await mount(spec, {})
+          }
+        } else {
+          handle = await mount(spec, {})
+        }
+        live.add(handle)
+        return handle
+      }
+      sub.dispose = async (handle) => {
+        live.delete(handle)
+        return dispose(handle)
+      }
+      return sub
+    }
+    const substrate = makeSubstrate(true)
+    const channelSubstrate = makeSubstrate(false)
+
     // The command registry settles the UI request on abort, but nothing stops
     // the loop: measured 7 probe sessions created over 48s *after* the caller
     // aborted. Cancel live probes and refuse to mount more.
@@ -237,29 +271,8 @@ export function apply(ctx, config = {}) {
     if (signal?.aborted) cancelProbes()
     else signal?.addEventListener?.('abort', cancelProbes, { once: true })
 
-    substrate.mount = async (spec) => {
-      if (aborted) throw new Error('ph step aborted — no further probes mounted')
-      let handle
-      if (preset) {
-        try {
-          handle = await mountProbe(spec, { agentPreset: preset, composePreset: preset })
-        } catch (e) {
-          notes.push(`probe preset "${preset}" mount failed (${String(e?.message ?? e).slice(0, 120)}) — mounting without it`)
-          handle = await mountProbe(spec, {})
-        }
-      } else {
-        handle = await mountProbe(spec, {})
-      }
-      live.add(handle)
-      return handle
-    }
-    substrate.dispose = async (handle) => {
-      live.delete(handle)
-      return disposeProbe(handle)
-    }
-
     try {
-      const channels = createDshChannels({ substrate, spec: { model: route }, notes, retries: 1 })
+      const channels = createDshChannels({ substrate: channelSubstrate, spec: { model: route }, notes, retries: 1 })
       // The gate must name the agent whose UI dispatched this command:
       // the desktop answerer is agent-scoped, so an agent-less ask() reaches
       // only global answerers and settles NO_PROVIDER (measured).
