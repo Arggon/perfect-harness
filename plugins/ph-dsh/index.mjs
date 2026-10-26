@@ -124,6 +124,11 @@ const loadDeps = async (config = {}) => {
 export const name = 'perfect-harness'
 export const inject = [] // every service is probed at use time — optional everywhere
 
+// Bump on every behavioral change: /ph status prints this, so a host running a
+// hot-reloaded module is distinguishable from one still on the previous
+// generation without guessing from behavior.
+const BUILD = '2026-10-25.3'
+
 /** Working directory of the Session that dispatched the command, if readable. */
 const callerDirectory = (ctx, agent) => {
   try {
@@ -182,7 +187,7 @@ export function apply(ctx, config = {}) {
       ? `${model.provider ?? '?'}/${model.model ?? '?'}`
       : 'host default route'
     return [
-      'perfect-harness — recursive harness optimization',
+      `perfect-harness ${BUILD} — recursive harness optimization`,
       `  ${formatProbe(probe)}`,
       `  host deps: ${hostNodeModules(config) ?? 'not found — deps-dependent seams stay off'}`,
       `  route: ${route}`,
