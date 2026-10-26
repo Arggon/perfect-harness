@@ -127,7 +127,7 @@ export const inject = [] // every service is probed at use time — optional eve
 // Bump on every behavioral change: /ph status prints this, so a host running a
 // hot-reloaded module is distinguishable from one still on the previous
 // generation without guessing from behavior.
-const BUILD = '2026-10-25.3'
+const BUILD = '2026-10-25.4'
 
 /** Working directory of the Session that dispatched the command, if readable. */
 const callerDirectory = (ctx, agent) => {
@@ -242,7 +242,7 @@ export function apply(ctx, config = {}) {
       let handle
       if (preset) {
         try {
-          handle = await mountProbe(spec, { agentPreset: preset })
+          handle = await mountProbe(spec, { agentPreset: preset, composePreset: preset })
         } catch (e) {
           notes.push(`probe preset "${preset}" mount failed (${String(e?.message ?? e).slice(0, 120)}) — mounting without it`)
           handle = await mountProbe(spec, {})
@@ -260,7 +260,10 @@ export function apply(ctx, config = {}) {
 
     try {
       const channels = createDshChannels({ substrate, spec: { model: route }, notes, retries: 1 })
-      const gate = createDshHumanGate({ ctx, notes })
+      // The gate must name the agent whose UI dispatched this command:
+      // the desktop answerer is agent-scoped, so an agent-less ask() reaches
+      // only global answerers and settles NO_PROVIDER (measured).
+      const gate = createDshHumanGate({ ctx, agent: caller, signal, notes })
       const library = await ensureLibrary()
       const started = Date.now()
       const r = await runImprovementStep({

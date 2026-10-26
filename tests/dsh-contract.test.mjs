@@ -80,7 +80,16 @@ function makeDshContext({ withAgents = true, scripted = null, baseRows = null } 
     systemPrompt: { section: () => {}, context: () => {} },
     agentPresets: {
       _registered: new Map(),
+      _mounted: [],
       _baseRows: baseRows,
+      // Mounting is separate from meta.agentPreset (which only labels the
+      // session): the web app and the subagent path call mount/composeFrom
+      // themselves, so a probe that only sets the label stays preset-free.
+      async mount(_ctx, id) {
+        if (id !== 'cordis') throw new Error(`preset ${id} not found`)
+        this._mounted.push(id)
+        return { id }
+      },
       async readDocument(id) {
         if (id !== 'standard' || !this._baseRows) throw new Error(`preset ${id} not found`)
         return { content: '<yaml>', name: 'standard' }
@@ -219,6 +228,35 @@ test('mount: unknown tool names filtered to notes, never passed to restrict', as
 test('mount: throws without agents.create seam', async () => {
   const sub = createDshSubstrate({ ctx: makeDshContext({ withAgents: false }) })
   await assert.rejects(() => sub.mount({}), /agents\.create/)
+})
+
+test('mount: composePreset composes the caller preset into the agent scope before restrict', async () => {
+  const ctx = makeDshContext()
+  const sub = createDshSubstrate({ ctx })
+  const handle = await sub.mount(
+    { tools: { keep: ['fs_read'] } },
+    { agentPreset: 'cordis', composePreset: 'cordis' },
+  )
+  // meta.agentPreset labels the session; the compose call is what supplies the
+  // preset's plugins (measured: without it a probe had only working_directory).
+  assert.equal(handle.agent.session._options.meta.agentPreset, 'cordis')
+  assert.deepEqual(ctx._services.agentPresets._mounted, ['cordis'])
+  assert.deepEqual(handle.agent.session._agentCtx._restricts, [{ allow: ['fs_read'] }])
+  assert.ok(handle.notes.some((n) => n.includes('composed into the probe agent')), JSON.stringify(handle.notes))
+  await sub.dispose(handle)
+})
+
+test('mount: composePreset without a mount seam throws instead of measuring a bare agent', async () => {
+  const ctx = makeDshContext()
+  ctx._services.agentPresets.mount = undefined
+  const sub = createDshSubstrate({ ctx })
+  await assert.rejects(() => sub.mount({}, { composePreset: 'cordis' }), /agentPresets\.mount is unavailable/)
+})
+
+test('mount: composePreset failure propagates (a probe without its harness is not the harness)', async () => {
+  const ctx = makeDshContext()
+  const sub = createDshSubstrate({ ctx })
+  await assert.rejects(() => sub.mount({}, { composePreset: 'nope' }), /preset nope not found/)
 })
 
 test('mount: seeded fork builds seed + marks meta + counts prefix', async () => {
